@@ -16638,6 +16638,8 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
             /* v2.89.50 — stdout만 캡쳐. stderr (진행 메시지·DeprecationWarning) 채팅에 안 끼게. */
             r = await runCommandCaptured(`${_pythonCmd()} ${JSON.stringify(entry.tool)}`, toolsDir, () => {}, 90000, 'stdout');
         } catch (e: any) {
+            const body = `${a.emoji} **${a.name}** — \`${entry.tool}\` 실행 에러\n\n\`\`\`\n${e?.message || e}\n\`\`\``;
+            try { fs.writeFileSync(path.join(sessionDir, '_shortcut.md'), `# ${entry.tool} (${source})\n\n명령: ${prompt}\n\n${body}\n`); } catch { /* ignore */ }
             post({ type: 'agentEnd', agent: entry.agentId });
             post({ type: 'error', value: `⚠️ 도구 실행 에러: ${e?.message || e}` });
             return true;
@@ -16657,6 +16659,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
             this._displayMessages.push({ text: body, role: 'ai' });
             post({ type: 'response', value: body });
             appendConversationLog({ speaker: a.name, emoji: a.emoji, section: `도구 실행 (${source})`, body: `${entry.tool} 실패: ${toolOut.slice(0, 500)}` });
+            try { fs.writeFileSync(path.join(sessionDir, '_shortcut.md'), `# ${entry.tool} (${source})\n\n명령: ${prompt}\n\n${body}\n`); } catch { /* ignore */ }
             return true;
         }
 

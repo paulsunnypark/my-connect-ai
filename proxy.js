@@ -8,6 +8,7 @@ loadDotEnv(path.join(__dirname, '.env'));
 const CONFIG = {
   host: process.env.CONNECTAI_PROXY_HOST || '127.0.0.1',
   port: Number(process.env.CONNECTAI_PROXY_PORT || 4000),
+  compatPort: Number(process.env.CONNECTAI_PROXY_COMPAT_PORT || 0),
   mode: (process.env.CONNECTAI_PROXY_MODE || 'ollama').toLowerCase(),
   ollamaBaseUrl: trimSlash(process.env.CONNECTAI_PROXY_OLLAMA_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434'),
   cloudBaseUrl: trimSlash(process.env.CONNECTAI_PROXY_CLOUD_BASE_URL || process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'),
@@ -17,7 +18,11 @@ const CONFIG = {
   requestTimeoutMs: Number(process.env.CONNECTAI_PROXY_TIMEOUT_MS || 600000),
 };
 
-const server = http.createServer(async (req, res) => {
+const server = createProxyServer();
+const compatServer = CONFIG.compatPort && CONFIG.compatPort !== CONFIG.port ? createProxyServer() : null;
+
+function createProxyServer() {
+  return http.createServer(async (req, res) => {
   setCors(res);
 
   if (req.method === 'OPTIONS') {
@@ -65,6 +70,12 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     sendError(res, 500, error);
   }
+  });
+}
+
+server.on('error', error => {
+  console.error(`[connect-ai-proxy] server error: ${error.message || error}`);
+  process.exitCode = 1;
 });
 
 server.listen(CONFIG.port, CONFIG.host, () => {
@@ -76,6 +87,15 @@ server.listen(CONFIG.port, CONFIG.host, () => {
     console.log('[connect-ai-proxy] cloud disabled; set OPENROUTER_API_KEY and CONNECTAI_PROXY_CLOUD_MODEL to enable it');
   }
 });
+
+if (compatServer) {
+  compatServer.on('error', error => {
+    console.error(`[connect-ai-proxy] compat server error: ${error.message || error}`);
+  });
+  compatServer.listen(CONFIG.compatPort, CONFIG.host, () => {
+    console.log(`[connect-ai-proxy] LM Studio compatibility listener on http://${CONFIG.host}:${CONFIG.compatPort}`);
+  });
+}
 
 function loadDotEnv(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -143,9 +163,11 @@ async function handleTags(res) {
 async function handleOllamaChat(req, res) {
   const body = await readJson(req);
   if (shouldUseCloud(body.model)) {
+    logRoute('ollama-chat', body.model, 'cloud', body);
     await sendCloudAsOllama(body, res);
     return;
   }
+  logRoute('ollama-chat', body.model, 'ollama', body);
   await requestAndPipe({
     method: 'POST',
     targetUrl: `${CONFIG.ollamaBaseUrl}/api/chat`,
@@ -171,6 +193,7 @@ async function handleOpenAIModels(res) {
 async function handleOpenAIChat(req, res) {
   const body = await readJson(req);
   if (shouldUseCloud(body.model)) {
+    logRoute('openai-chat', body.model, 'cloud', body);
     await requestAndPipe({
       method: 'POST',
       targetUrl: `${CONFIG.cloudBaseUrl}/chat/completions`,
@@ -180,6 +203,7 @@ async function handleOpenAIChat(req, res) {
     });
     return;
   }
+  logRoute('openai-chat', body.model, 'ollama', body);
   await requestAndPipe({
     method: 'POST',
     targetUrl: `${CONFIG.ollamaBaseUrl}/v1/chat/completions`,
@@ -201,16 +225,28 @@ function isCloudConfigured() {
   return Boolean(CONFIG.cloudApiKey && CONFIG.cloudModel);
 }
 
+function logRoute(kind, requestedModel, route, body) {
+  const stream = body?.stream !== false;
+  const format = body?.format ? ` format=${body.format}` : '';
+  const inferredJson = route === 'cloud' && !body?.format && messagesSuggestJson(body?.messages) ? ' inferredJson=true' : '';
+  console.log(`[connect-ai-proxy] ${kind} model=${requestedModel || '(default)'} route=${route} stream=${stream}${format}${inferredJson}`);
+}
+
 async function sendCloudAsOllama(ollamaBody, res) {
   const stream = ollamaBody.stream !== false;
+  const jsonResponse = ollamaBody.format === 'json' || messagesSuggestJson(ollamaBody.messages);
+  const bufferedJson = stream && jsonResponse;
   const cloudBody = {
     model: CONFIG.cloudModel,
     messages: Array.isArray(ollamaBody.messages) ? ollamaBody.messages : [],
-    stream,
+    stream: bufferedJson ? false : stream,
     temperature: ollamaBody.options?.temperature,
     top_p: ollamaBody.options?.top_p,
-    max_tokens: ollamaBody.options?.num_predict,
   };
+
+  const maxTokens = normalizeMaxTokens(ollamaBody.options?.num_predict);
+  if (maxTokens !== undefined) cloudBody.max_tokens = maxTokens;
+  if (jsonResponse) cloudBody.response_format = { type: 'json_object' };
 
   for (const key of Object.keys(cloudBody)) {
     if (cloudBody[key] === undefined) delete cloudBody[key];
@@ -219,6 +255,42 @@ async function sendCloudAsOllama(ollamaBody, res) {
   if (!stream) {
     const data = await requestJson('POST', `${CONFIG.cloudBaseUrl}/chat/completions`, cloudBody, cloudHeaders());
     sendJson(res, 200, toOllamaNonStream(data, ollamaBody.model || CONFIG.cloudAlias));
+    return;
+  }
+
+  if (bufferedJson) {
+    let data = await requestJson('POST', `${CONFIG.cloudBaseUrl}/chat/completions`, cloudBody, cloudHeaders());
+    let content = cloudMessageContent(data);
+    if (isEmptyJsonContent(content)) {
+      console.warn(`[connect-ai-proxy] buffered-json empty response; retrying without response_format`);
+      const retryBody = {
+        ...cloudBody,
+        response_format: undefined,
+        messages: strengthenJsonMessages(cloudBody.messages),
+      };
+      for (const key of Object.keys(retryBody)) {
+        if (retryBody[key] === undefined) delete retryBody[key];
+      }
+      data = await requestJson('POST', `${CONFIG.cloudBaseUrl}/chat/completions`, retryBody, cloudHeaders());
+      content = cloudMessageContent(data);
+    }
+    console.log(`[connect-ai-proxy] buffered-json contentLength=${content.length} preview=${JSON.stringify(content.slice(0, 160))}`);
+    res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    if (content) {
+      res.write(JSON.stringify({
+        model: ollamaBody.model || CONFIG.cloudAlias,
+        created_at: new Date().toISOString(),
+        message: { role: 'assistant', content },
+        done: false,
+      }) + '\n');
+    }
+    res.write(JSON.stringify({
+      model: ollamaBody.model || CONFIG.cloudAlias,
+      created_at: new Date().toISOString(),
+      message: { role: 'assistant', content: '' },
+      done: true,
+    }) + '\n');
+    res.end();
     return;
   }
 
@@ -241,10 +313,50 @@ async function sendCloudAsOllama(ollamaBody, res) {
 }
 
 function openAICloudBody(body) {
-  return {
+  const cloudBody = {
     ...body,
     model: CONFIG.cloudModel,
   };
+  if (cloudBody.max_tokens !== undefined) {
+    const maxTokens = normalizeMaxTokens(cloudBody.max_tokens);
+    if (maxTokens === undefined) delete cloudBody.max_tokens;
+    else cloudBody.max_tokens = maxTokens;
+  }
+  return cloudBody;
+}
+
+function normalizeMaxTokens(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
+}
+
+function messagesSuggestJson(messages) {
+  if (!Array.isArray(messages)) return false;
+  const text = messages
+    .map(message => typeof message?.content === 'string' ? message.content : '')
+    .join('\n')
+    .slice(0, 20000);
+
+  if (!/\bjson\b/i.test(text)) return false;
+  return /"tasks"|tasks|업무|작업|brief|브리프|계획|plan/i.test(text);
+}
+
+function isEmptyJsonContent(content) {
+  const trimmed = String(content || '').trim();
+  return !trimmed || trimmed === '{}' || trimmed === '[]';
+}
+
+function strengthenJsonMessages(messages) {
+  const base = Array.isArray(messages) ? messages.slice() : [];
+  return [
+    {
+      role: 'system',
+      content: 'Return one valid JSON object only. Do not return an empty object. If this is a planning request, include non-empty "brief" and "tasks" fields.',
+    },
+    ...base,
+  ];
 }
 
 function toOllamaNonStream(data, model) {
@@ -253,10 +365,15 @@ function toOllamaNonStream(data, model) {
     created_at: new Date().toISOString(),
     message: {
       role: 'assistant',
-      content: data?.choices?.[0]?.message?.content || '',
+      content: cloudMessageContent(data),
     },
     done: true,
   };
+}
+
+function cloudMessageContent(data) {
+  const message = data?.choices?.[0]?.message || {};
+  return String(message.content || '');
 }
 
 function cloudHeaders() {
@@ -436,6 +553,7 @@ function sendJson(res, statusCode, body) {
 
 function sendError(res, fallbackStatusCode, error) {
   const statusCode = error.statusCode || fallbackStatusCode;
+  console.error(`[connect-ai-proxy] error status=${statusCode}: ${error.message || error}`);
   sendJson(res, statusCode, {
     error: {
       message: error.message || String(error),

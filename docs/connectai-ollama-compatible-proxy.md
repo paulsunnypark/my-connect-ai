@@ -2,6 +2,8 @@
 
 This proxy lets the installed ConnectAI extension keep using an Ollama-compatible endpoint while requests are routed locally or to an OpenAI-compatible cloud provider.
 
+For a full setup and migration manual, see [connectai-proxy-deployment-guide.md](./connectai-proxy-deployment-guide.md).
+
 Default behavior is local-only:
 
 ```env
