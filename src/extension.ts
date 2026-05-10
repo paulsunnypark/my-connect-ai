@@ -111,6 +111,31 @@ function _resolveFlexiblePath(input: string, root: string): { abs: string; reaso
     return { abs };
 }
 
+function _resolveCompanyActionPath(input: string, root: string, sessionDir?: string): { abs: string; reason?: string } | null {
+    if (typeof input !== 'string') return null;
+    const raw = input.trim();
+    if (!raw) return null;
+    if (path.isAbsolute(raw) || raw.startsWith('~') || raw.startsWith('$')) {
+        return _resolveFlexiblePath(raw, root);
+    }
+    const normalized = raw.replace(/\\/g, '/').replace(/^\.\/+/, '');
+    const parts = normalized.split('/').filter(Boolean);
+    if (!normalized.startsWith('sessions/')) {
+        const companyRootDirs = new Set(['_shared', '_agents', 'sessions', 'approvals', 'site', 'logs', 'tools']);
+        if (sessionDir && parts.length > 0 && !companyRootDirs.has(parts[0])) {
+            return _resolveFlexiblePath(normalized, sessionDir);
+        }
+        return _resolveFlexiblePath(normalized, root);
+    }
+    if (sessionDir && parts.length >= 3) {
+        const explicitSessionDir = path.join(root, parts[0], parts[1]);
+        if (!fs.existsSync(explicitSessionDir)) {
+            return _resolveFlexiblePath(parts.slice(2).join('/'), sessionDir);
+        }
+    }
+    return _resolveFlexiblePath(normalized, root);
+}
+
 /* v2.89.104 — Claude 익스텐션 호환 unified diff. edit_file 후 변경 hunk를
    ±3줄 컨텍스트로 표시. 변경 없으면 빈 문자열 반환.
    알고리즘: line-by-line LCS는 비용 큼 → 단순 chunk 비교(Patience 스타일 간소화).
@@ -6589,6 +6614,8 @@ ${a.specialty}${personaBlock}
 - 시스템 컨텍스트에 (1) 당신의 개인 목표 (2) 회사 공동 목표 (3) 회사 정체성/의사결정 (4) 당신의 개인 메모리가 우선순위 순서대로 주입됩니다. 1번을 가장 신뢰하세요.
 - 같은 세션에서 다른 에이전트들이 먼저 만든 산출물도 함께 제공됩니다 (있을 경우).
 - 당신의 산출물은 자동으로 sessions/ 폴더에 저장되어 다음 세션에서 다시 참조됩니다.
+- 회사 작업 중 파일 경로는 회사 폴더 기준입니다. \`sessions/...\`는 코드 워크스페이스가 아니라 회사 폴더의 \`sessions/...\`를 뜻합니다.
+- 현재 라운드 산출물을 만들거나 읽을 때는 가능하면 파일명만 쓰세요. 시스템이 현재 세션 폴더에 저장합니다. 예: \`<create_file path="writer_emails.md">...\`
 
 [로컬 파일·터미널 직접 조작 (v2.89.94+)]
 당신은 사용자 컴퓨터의 실제 파일 시스템과 터미널에 직접 연결되어 있습니다. 텍스트로 "만들었다·편집했다"고 하지 말고 아래 태그로 실제 실행하세요. 시스템이 자동으로 디스크에 적용합니다.
@@ -17433,10 +17460,10 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                 try {
                     const fileReport: string[] = [];
                     const fileInjections: string[] = [];
-                    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-                    const fileActionRoot = wsRoot || getCompanyDir();
+                    const fileActionRoot = getCompanyDir();
                     const fr = await this._executeActions(out, {
                         rootOverride: fileActionRoot,
+                        sessionDir,
                         appendToOutput: (s) => fileInjections.push(s),
                         silent: true,
                         skipRunCommand: true,
@@ -18083,7 +18110,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
     // --------------------------------------------------------
     private async _executeActions(
         aiMessage: string,
-        opts?: { rootOverride?: string; appendToOutput?: (s: string) => void; silent?: boolean; skipRunCommand?: boolean }
+        opts?: { rootOverride?: string; sessionDir?: string; appendToOutput?: (s: string) => void; silent?: boolean; skipRunCommand?: boolean }
     ): Promise<string[]> {
         const report: string[] = [];
         let brainModified = false;
@@ -18122,6 +18149,9 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         if (usedFallbackRoot) {
             report.push(`📁 워크스페이스 미오픈 — \`${rootPath.replace(os.homedir(), '~')}\` 를 root로 사용합니다.`);
         }
+        const resolveActionPath = (p: string) => opts?.sessionDir
+            ? _resolveCompanyActionPath(p, rootPath!, opts.sessionDir)
+            : _resolveFlexiblePath(p, rootPath!);
         /* v2.89.95 — fence-unwrap 단순화. 이전 v2.89.93 regex(중첩 lazy + 긴 alternation)는
            특정 입력에서 V8 정규식 엔진의 백트래킹 한계에 부딪힐 가능성이 있어 안전한 라인
            단위 처리로 교체. 액션 태그를 감싸는 ```xml ... ``` 블록만 정확히 unwrap. */
@@ -18147,7 +18177,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                 content = lines.join('\n').trim();
             }
 
-            const resolved = _resolveFlexiblePath(relPath, rootPath);
+            const resolved = resolveActionPath(relPath);
             if (!resolved) {
                 report.push(`❌ 생성 차단: ${relPath} — 경로를 해석할 수 없습니다.`);
                 continue;
@@ -18183,7 +18213,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         while ((match = editRegex.exec(aiMessage)) !== null) {
             const relPath = match[1].trim();
             const body = match[2];
-            const resolved = _resolveFlexiblePath(relPath, rootPath);
+            const resolved = resolveActionPath(relPath);
             if (!resolved) {
                 report.push(`❌ 편집 차단: ${relPath} — 경로를 해석할 수 없습니다.`);
                 continue;
@@ -18283,7 +18313,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         const deleteRegex = /<(?:delete_file|delete)\s+(?:path|file|name|경로|파일)=['"]?([^'">]+?)['"]?\s*\/?>(?:<\/(?:delete_file|delete)>)?/gi;
         while ((match = deleteRegex.exec(aiMessage)) !== null) {
             const relPath = match[1].trim();
-            const resolved = _resolveFlexiblePath(relPath, rootPath);
+            const resolved = resolveActionPath(relPath);
             if (!resolved) {
                 report.push(`❌ 삭제 차단: ${relPath} — 경로를 해석할 수 없습니다.`);
                 continue;
@@ -18322,7 +18352,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         const READ_CAP = 32000;
         while ((match = readRegex.exec(aiMessage)) !== null) {
             const relPath = match[1].trim();
-            const resolved = _resolveFlexiblePath(relPath, rootPath);
+            const resolved = resolveActionPath(relPath);
             if (!resolved) {
                 report.push(`❌ 읽기 차단: ${relPath} — 경로를 해석할 수 없습니다.`);
                 continue;
@@ -18383,7 +18413,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         const listRegex = /<(?:list_files|list_dir|ls)\s+(?:path|dir|name|경로|파일)=['"]?([^'">]*?)['"]?\s*\/?>(?:<\/(?:list_files|list_dir|ls)>)?/gi;
         while ((match = listRegex.exec(aiMessage)) !== null) {
             const relDir = match[1].trim() || '.';
-            const resolved = _resolveFlexiblePath(relDir, rootPath);
+            const resolved = resolveActionPath(relDir);
             if (!resolved) {
                 report.push(`❌ 목록 차단: ${relDir} — 경로를 해석할 수 없습니다.`);
                 continue;
@@ -18418,7 +18448,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         while ((match = globRegex.exec(aiMessage)) !== null) {
             const pattern = match[1].trim();
             const relRoot = (match[2] || '.').trim();
-            const resolved = _resolveFlexiblePath(relRoot, rootPath);
+            const resolved = resolveActionPath(relRoot);
             if (!resolved || resolved.reason) {
                 report.push(`❌ glob 차단: ${pattern} — ${resolved?.reason || '경로 해석 불가'}`);
                 continue;
@@ -18443,7 +18473,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
             const pattern = match[1].trim();
             const relRoot = (match[2] || '.').trim();
             const fileGlob = match[3] ? match[3].trim() : undefined;
-            const resolved = _resolveFlexiblePath(relRoot, rootPath);
+            const resolved = resolveActionPath(relRoot);
             if (!resolved || resolved.reason) {
                 report.push(`❌ grep 차단: ${pattern} — ${resolved?.reason || '경로 해석 불가'}`);
                 continue;
@@ -18474,7 +18504,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         const revealRegex = /<(?:reveal_in_explorer|reveal|finder|explorer)\s+(?:path|file|name|경로|파일)=['"]?([^'">]+?)['"]?\s*\/?>(?:<\/(?:reveal_in_explorer|reveal|finder|explorer)>)?/gi;
         while ((match = revealRegex.exec(aiMessage)) !== null) {
             const relPath = match[1].trim();
-            const resolved = _resolveFlexiblePath(relPath, rootPath);
+            const resolved = resolveActionPath(relPath);
             if (!resolved) { report.push(`❌ 익스플로러 열기 실패: ${relPath} — 경로 해석 불가.`); continue; }
             const r = _revealInOsExplorer(resolved.abs);
             report.push((r.ok ? '🗂 ' : '❌ ') + r.message.replace(os.homedir(), '~'));
@@ -18484,7 +18514,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         const openAppRegex = /<(?:open_file|open_in_app|launch)\s+(?:path|file|name|경로|파일)=['"]?([^'">]+?)['"]?\s*\/?>(?:<\/(?:open_file|open_in_app|launch)>)?/gi;
         while ((match = openAppRegex.exec(aiMessage)) !== null) {
             const relPath = match[1].trim();
-            const resolved = _resolveFlexiblePath(relPath, rootPath);
+            const resolved = resolveActionPath(relPath);
             if (!resolved) { report.push(`❌ 파일 열기 실패: ${relPath} — 경로 해석 불가.`); continue; }
             const r = _openInDefaultApp(resolved.abs);
             report.push((r.ok ? '🚀 ' : '❌ ') + r.message.replace(os.homedir(), '~'));
