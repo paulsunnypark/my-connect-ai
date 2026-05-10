@@ -14,6 +14,7 @@ const CONFIG = {
   cloudBaseUrl: trimSlash(process.env.CONNECTAI_PROXY_CLOUD_BASE_URL || process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'),
   cloudApiKey: process.env.CONNECTAI_PROXY_CLOUD_API_KEY || process.env.OPENROUTER_API_KEY || '',
   cloudModel: normalizeCloudModel(process.env.CONNECTAI_PROXY_CLOUD_MODEL || process.env.OPENROUTER_MODEL || ''),
+  fallbackCloudModel: normalizeCloudModel(process.env.CONNECTAI_PROXY_FALLBACK_CLOUD_MODEL || ''),
   cloudAlias: process.env.CONNECTAI_PROXY_CLOUD_ALIAS || 'openrouter-cloud',
   requestTimeoutMs: Number(process.env.CONNECTAI_PROXY_TIMEOUT_MS || 600000),
 };
@@ -42,6 +43,7 @@ function createProxyServer() {
         cloudConfigured: Boolean(CONFIG.cloudApiKey && CONFIG.cloudModel),
         cloudAlias: CONFIG.cloudAlias,
         cloudModel: CONFIG.cloudModel || null,
+        fallbackCloudModel: CONFIG.fallbackCloudModel || null,
       });
       return;
     }
@@ -155,6 +157,23 @@ async function handleTags(res) {
         quantization_level: 'remote',
       },
     });
+    if (CONFIG.fallbackCloudModel) {
+      models.push({
+        name: `openrouter/${CONFIG.fallbackCloudModel}`,
+        model: `openrouter/${CONFIG.fallbackCloudModel}`,
+        modified_at: new Date().toISOString(),
+        size: 0,
+        digest: `cloud:${CONFIG.fallbackCloudModel}`,
+        details: {
+          parent_model: CONFIG.fallbackCloudModel,
+          format: 'openai-compatible',
+          family: 'openrouter',
+          families: ['openrouter'],
+          parameter_size: 'cloud',
+          quantization_level: 'remote',
+        },
+      });
+    }
   }
 
   sendJson(res, 200, { models });
@@ -216,6 +235,7 @@ function shouldUseCloud(requestedModel) {
   if (!isCloudConfigured()) return false;
   if (CONFIG.mode === 'cloud') return true;
   if (CONFIG.mode !== 'auto') return false;
+  if (CONFIG.fallbackCloudModel) return true;
 
   const model = String(requestedModel || '').trim();
   return model === CONFIG.cloudAlias || model === CONFIG.cloudModel || model.startsWith('openrouter/') || model.startsWith('cloud:');
@@ -229,19 +249,22 @@ function logRoute(kind, requestedModel, route, body) {
   const stream = body?.stream !== false;
   const format = body?.format ? ` format=${body.format}` : '';
   const inferredJson = route === 'cloud' && !body?.format && messagesSuggestJson(body?.messages) ? ' inferredJson=true' : '';
-  console.log(`[connect-ai-proxy] ${kind} model=${requestedModel || '(default)'} route=${route} stream=${stream}${format}${inferredJson}`);
+  const target = route === 'cloud' ? ` target=${resolveCloudModel(requestedModel)}` : '';
+  console.log(`[connect-ai-proxy] ${kind} model=${requestedModel || '(default)'} route=${route}${target} stream=${stream}${format}${inferredJson}`);
 }
 
 async function sendCloudAsOllama(ollamaBody, res) {
   const stream = ollamaBody.stream !== false;
   const jsonResponse = ollamaBody.format === 'json' || messagesSuggestJson(ollamaBody.messages);
   const bufferedJson = stream && jsonResponse;
+  const targetModel = resolveCloudModel(ollamaBody.model);
   const cloudBody = {
-    model: CONFIG.cloudModel,
+    model: targetModel,
     messages: Array.isArray(ollamaBody.messages) ? ollamaBody.messages : [],
     stream: bufferedJson ? false : stream,
     temperature: ollamaBody.options?.temperature,
     top_p: ollamaBody.options?.top_p,
+    reasoning: { effort: 'none', exclude: true },
   };
 
   const maxTokens = normalizeMaxTokens(ollamaBody.options?.num_predict);
@@ -315,7 +338,8 @@ async function sendCloudAsOllama(ollamaBody, res) {
 function openAICloudBody(body) {
   const cloudBody = {
     ...body,
-    model: CONFIG.cloudModel,
+    model: resolveCloudModel(body?.model),
+    reasoning: body?.reasoning || { effort: 'none', exclude: true },
   };
   if (cloudBody.max_tokens !== undefined) {
     const maxTokens = normalizeMaxTokens(cloudBody.max_tokens);
@@ -323,6 +347,24 @@ function openAICloudBody(body) {
     else cloudBody.max_tokens = maxTokens;
   }
   return cloudBody;
+}
+
+function resolveCloudModel(requestedModel) {
+  const model = String(requestedModel || '').trim();
+  if (CONFIG.mode === 'cloud') {
+    if (model.startsWith('openrouter/') || model.startsWith('cloud:')) return stripCloudModelPrefix(model);
+    return CONFIG.cloudModel;
+  }
+  if (model === CONFIG.cloudAlias || model === CONFIG.cloudModel) return CONFIG.cloudModel;
+  if (model.startsWith('openrouter/') || model.startsWith('cloud:')) return stripCloudModelPrefix(model);
+  if (CONFIG.fallbackCloudModel) return CONFIG.fallbackCloudModel;
+  return stripCloudModelPrefix(model) || CONFIG.cloudModel;
+}
+
+function stripCloudModelPrefix(model) {
+  if (model.startsWith('openrouter/')) return model.slice('openrouter/'.length);
+  if (model.startsWith('cloud:')) return model.slice('cloud:'.length);
+  return model;
 }
 
 function normalizeMaxTokens(value) {
