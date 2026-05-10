@@ -376,13 +376,32 @@ function normalizeMaxTokens(value) {
 
 function messagesSuggestJson(messages) {
   if (!Array.isArray(messages)) return false;
-  const text = messages
-    .map(message => typeof message?.content === 'string' ? message.content : '')
+  const contents = messages
+    .map(message => typeof message?.content === 'string' ? message.content : '');
+  const text = contents
     .join('\n')
     .slice(0, 20000);
+  const userText = messages
+    .filter(message => message?.role === 'user' && typeof message.content === 'string')
+    .map(message => message.content)
+    .join('\n')
+    .slice(0, 8000);
 
   if (!/\bjson\b/i.test(text)) return false;
-  return /"tasks"|tasks|업무|작업|brief|브리프|계획|plan/i.test(text);
+
+  const strictJsonOnly = /반드시\s*(?:아래\s*)?JSON\s*형식으로만|JSON\s*외\s*텍스트|Return only (?:valid )?JSON|Output only (?:valid )?JSON|순수\s*JSON/i.test(text);
+  if (!strictJsonOnly) return false;
+
+  const isSpecialistDispatch = /^\s*\[CEO의 지시\]/m.test(userText);
+  const isPlanner = /"brief"\s*:/.test(text) && /"tasks"\s*:/.test(text);
+  const isConfer = /"turns"\s*:/.test(text) && /from/i.test(text) && /to/i.test(text);
+  const isDecisionExtract = /"decisions"\s*:/.test(text) || /의사결정\s*로그|decisions\.md/i.test(text);
+  const isToolClassifier = /"agent"\s*:/.test(text) && /"tool"\s*:/.test(text) && /도구|tool/i.test(text);
+
+  if (isSpecialistDispatch) {
+    return isConfer || isDecisionExtract || isToolClassifier;
+  }
+  return isPlanner || isConfer || isDecisionExtract || isToolClassifier;
 }
 
 function isEmptyJsonContent(content) {
