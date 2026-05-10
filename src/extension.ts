@@ -6346,10 +6346,52 @@ function readRecentConversations(maxChars = 2500): string {
 }
 
 function makeSessionDir(): string {
+  cleanupEmptySessionDirs();
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
   const dir = path.join(getCompanyDir(), 'sessions', ts);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function cleanupEmptySessionDirs(): number {
+  try {
+    const sessionsRoot = path.join(getCompanyDir(), 'sessions');
+    if (!fs.existsSync(sessionsRoot)) return 0;
+    const now = Date.now();
+    const minAgeMs = 30 * 60 * 1000;
+    const maxEmptyToKeep = 10;
+    const emptyDirs = fs.readdirSync(sessionsRoot)
+      .map(name => path.join(sessionsRoot, name))
+      .filter(p => {
+        try {
+          if (!fs.statSync(p).isDirectory()) return false;
+          return fs.readdirSync(p).filter(n => n !== '.DS_Store').length === 0;
+        } catch { return false; }
+      })
+      .map(p => ({ path: p, mtimeMs: fs.statSync(p).mtimeMs }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    let removed = 0;
+    emptyDirs.forEach((entry, index) => {
+      const oldEnough = now - entry.mtimeMs >= minAgeMs;
+      const aboveKeepLimit = index >= maxEmptyToKeep;
+      if (!oldEnough && !aboveKeepLimit) return;
+      try {
+        const leftovers = fs.readdirSync(entry.path).filter(n => n !== '.DS_Store');
+        if (leftovers.length === 0) {
+          const dsStore = path.join(entry.path, '.DS_Store');
+          if (fs.existsSync(dsStore)) {
+            try { fs.unlinkSync(dsStore); } catch { /* ignore */ }
+          }
+          fs.rmdirSync(entry.path);
+          removed += 1;
+        }
+      } catch { /* ignore cleanup races */ }
+    });
+    return removed;
+  } catch {
+    return 0;
+  }
 }
 
 const CEO_PLANNER_PROMPT = _loadPrompt('ceo-planner.md');
