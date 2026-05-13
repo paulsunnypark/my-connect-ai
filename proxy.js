@@ -1,6 +1,7 @@
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const os = require('os');
 const path = require('path');
 
 loadDotEnv(path.join(__dirname, '.env'));
@@ -17,6 +18,9 @@ const CONFIG = {
   fallbackCloudModel: normalizeCloudModel(process.env.CONNECTAI_PROXY_FALLBACK_CLOUD_MODEL || ''),
   cloudAlias: process.env.CONNECTAI_PROXY_CLOUD_ALIAS || 'openrouter-cloud',
   requestTimeoutMs: Number(process.env.CONNECTAI_PROXY_TIMEOUT_MS || 600000),
+  upstreamRetries: Math.max(1, Number(process.env.CONNECTAI_PROXY_UPSTREAM_RETRIES || 3)),
+  retryBaseDelayMs: Math.max(100, Number(process.env.CONNECTAI_PROXY_RETRY_BASE_DELAY_MS || 750)),
+  pathGuardEnabled: process.env.CONNECTAI_PROXY_PATH_GUARD !== '0',
 };
 
 const server = createProxyServer();
@@ -44,6 +48,7 @@ function createProxyServer() {
         cloudAlias: CONFIG.cloudAlias,
         cloudModel: CONFIG.cloudModel || null,
         fallbackCloudModel: CONFIG.fallbackCloudModel || null,
+        pathGuard: CONFIG.pathGuardEnabled ? resolveConnectAiPaths() : null,
       });
       return;
     }
@@ -83,6 +88,10 @@ server.on('error', error => {
 server.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`[connect-ai-proxy] listening on http://${CONFIG.host}:${CONFIG.port}`);
   console.log(`[connect-ai-proxy] mode=${CONFIG.mode} ollama=${CONFIG.ollamaBaseUrl}`);
+  if (CONFIG.pathGuardEnabled) {
+    const guardPaths = resolveConnectAiPaths();
+    console.log(`[connect-ai-proxy] path guard company=${guardPaths.companyDir}`);
+  }
   if (CONFIG.cloudApiKey && CONFIG.cloudModel) {
     console.log(`[connect-ai-proxy] cloud alias=${CONFIG.cloudAlias} model=${CONFIG.cloudModel}`);
   } else {
@@ -135,7 +144,7 @@ function setCors(res) {
 async function handleTags(res) {
   let upstream;
   try {
-    upstream = await requestJson('GET', `${CONFIG.ollamaBaseUrl}/api/tags`);
+    upstream = await requestJson('GET', `${CONFIG.ollamaBaseUrl}/api/tags`, undefined, {}, { timeoutMs: 300, retries: 1 });
   } catch (error) {
     upstream = { models: [] };
   }
@@ -180,7 +189,7 @@ async function handleTags(res) {
 }
 
 async function handleOllamaChat(req, res) {
-  const body = await readJson(req);
+  const body = applyConnectAiPathGuard(await readJson(req));
   if (shouldUseCloud(body.model)) {
     logRoute('ollama-chat', body.model, 'cloud', body);
     await sendCloudAsOllama(body, res);
@@ -190,7 +199,7 @@ async function handleOllamaChat(req, res) {
   await requestAndPipe({
     method: 'POST',
     targetUrl: `${CONFIG.ollamaBaseUrl}/api/chat`,
-    body,
+    body: stripProxyOnlyFields(body),
     res,
   });
 }
@@ -198,7 +207,7 @@ async function handleOllamaChat(req, res) {
 async function handleOpenAIModels(res) {
   let data = [];
   try {
-    const upstream = await requestJson('GET', `${CONFIG.ollamaBaseUrl}/v1/models`);
+    const upstream = await requestJson('GET', `${CONFIG.ollamaBaseUrl}/v1/models`, undefined, {}, { timeoutMs: 300, retries: 1 });
     data = Array.isArray(upstream.data) ? upstream.data : [];
   } catch {}
 
@@ -210,7 +219,7 @@ async function handleOpenAIModels(res) {
 }
 
 async function handleOpenAIChat(req, res) {
-  const body = await readJson(req);
+  const body = applyConnectAiPathGuard(await readJson(req));
   if (shouldUseCloud(body.model)) {
     logRoute('openai-chat', body.model, 'cloud', body);
     await requestAndPipe({
@@ -226,7 +235,7 @@ async function handleOpenAIChat(req, res) {
   await requestAndPipe({
     method: 'POST',
     targetUrl: `${CONFIG.ollamaBaseUrl}/v1/chat/completions`,
-    body,
+    body: stripProxyOnlyFields(body),
     res,
   });
 }
@@ -249,8 +258,9 @@ function logRoute(kind, requestedModel, route, body) {
   const stream = body?.stream !== false;
   const format = body?.format ? ` format=${body.format}` : '';
   const inferredJson = route === 'cloud' && !body?.format && messagesSuggestJson(body?.messages) ? ' inferredJson=true' : '';
+  const guarded = body?.__connectAiPathGuard ? ' pathGuard=true' : '';
   const target = route === 'cloud' ? ` target=${resolveCloudModel(requestedModel)}` : '';
-  console.log(`[connect-ai-proxy] ${kind} model=${requestedModel || '(default)'} route=${route}${target} stream=${stream}${format}${inferredJson}`);
+  console.log(`[connect-ai-proxy] ${kind} model=${requestedModel || '(default)'} route=${route}${target} stream=${stream}${format}${inferredJson}${guarded}`);
 }
 
 async function sendCloudAsOllama(ollamaBody, res) {
@@ -283,7 +293,7 @@ async function sendCloudAsOllama(ollamaBody, res) {
 
   if (bufferedJson) {
     let data = await requestJson('POST', `${CONFIG.cloudBaseUrl}/chat/completions`, cloudBody, cloudHeaders());
-    let content = cloudMessageContent(data);
+    let content = sanitizeConnectAiActionText(cloudMessageContent(data));
     if (isEmptyJsonContent(content)) {
       console.warn(`[connect-ai-proxy] buffered-json empty response; retrying without response_format`);
       const retryBody = {
@@ -295,7 +305,7 @@ async function sendCloudAsOllama(ollamaBody, res) {
         if (retryBody[key] === undefined) delete retryBody[key];
       }
       data = await requestJson('POST', `${CONFIG.cloudBaseUrl}/chat/completions`, retryBody, cloudHeaders());
-      content = cloudMessageContent(data);
+      content = sanitizeConnectAiActionText(cloudMessageContent(data));
     }
     console.log(`[connect-ai-proxy] buffered-json contentLength=${content.length} preview=${JSON.stringify(content.slice(0, 160))}`);
     res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
@@ -318,21 +328,35 @@ async function sendCloudAsOllama(ollamaBody, res) {
   }
 
   res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
-  await requestOpenAIStream(`${CONFIG.cloudBaseUrl}/chat/completions`, cloudBody, cloudHeaders(), chunk => {
-    res.write(JSON.stringify({
-      model: ollamaBody.model || CONFIG.cloudAlias,
-      created_at: new Date().toISOString(),
-      message: { role: 'assistant', content: chunk },
-      done: false,
-    }) + '\n');
-  });
-  res.write(JSON.stringify({
-    model: ollamaBody.model || CONFIG.cloudAlias,
-    created_at: new Date().toISOString(),
-    message: { role: 'assistant', content: '' },
-    done: true,
-  }) + '\n');
-  res.end();
+  try {
+    const sanitizer = createActionTagStreamSanitizer(chunk => {
+      res.write(JSON.stringify({
+        model: ollamaBody.model || CONFIG.cloudAlias,
+        created_at: new Date().toISOString(),
+        message: { role: 'assistant', content: chunk },
+        done: false,
+      }) + '\n');
+    });
+    await requestOpenAIStreamWithRetry(`${CONFIG.cloudBaseUrl}/chat/completions`, cloudBody, cloudHeaders(), chunk => {
+      sanitizer.push(chunk);
+    });
+    sanitizer.flush();
+    writeOllamaDone(res, ollamaBody.model || CONFIG.cloudAlias);
+  } catch (error) {
+    console.error(`[connect-ai-proxy] cloud stream failed: ${error.message || error}`);
+    if (!res.writableEnded) {
+      res.write(JSON.stringify({
+        model: ollamaBody.model || CONFIG.cloudAlias,
+        created_at: new Date().toISOString(),
+        message: {
+          role: 'assistant',
+          content: `\n\n[ConnectAI proxy] Cloud stream failed: ${error.message || String(error)}`,
+        },
+        done: false,
+      }) + '\n');
+      writeOllamaDone(res, ollamaBody.model || CONFIG.cloudAlias);
+    }
+  }
 }
 
 function openAICloudBody(body) {
@@ -341,12 +365,20 @@ function openAICloudBody(body) {
     model: resolveCloudModel(body?.model),
     reasoning: body?.reasoning || { effort: 'none', exclude: true },
   };
+  delete cloudBody.__connectAiPathGuard;
   if (cloudBody.max_tokens !== undefined) {
     const maxTokens = normalizeMaxTokens(cloudBody.max_tokens);
     if (maxTokens === undefined) delete cloudBody.max_tokens;
     else cloudBody.max_tokens = maxTokens;
   }
   return cloudBody;
+}
+
+function stripProxyOnlyFields(body) {
+  if (!body || typeof body !== 'object' || !body.__connectAiPathGuard) return body;
+  const clean = { ...body };
+  delete clean.__connectAiPathGuard;
+  return clean;
 }
 
 function resolveCloudModel(requestedModel) {
@@ -420,13 +452,237 @@ function strengthenJsonMessages(messages) {
   ];
 }
 
+let connectAiPathCache = { at: 0, value: null };
+
+function resolveConnectAiPaths() {
+  const now = Date.now();
+  if (connectAiPathCache.value && now - connectAiPathCache.at < 5000) return connectAiPathCache.value;
+
+  const settings = readConnectAiSettings();
+  const brainRaw = process.env.CONNECTAI_LOCAL_BRAIN_PATH ||
+    process.env.CONNECTAI_KNOWLEDGE_ROOT ||
+    process.env.CONNECTAI_BRAIN_DIR ||
+    settings.localBrainPath ||
+    '';
+  const companyRaw = process.env.CONNECTAI_COMPANY_DIR || settings.companyDir || '';
+  const brainDir = normalizeUserPath(brainRaw) || path.join(os.homedir(), '.connect-ai-brain');
+  const companyDir = normalizeUserPath(companyRaw) || path.join(brainDir, '_company');
+  const value = {
+    brainDir,
+    companyDir,
+    sessionsDir: path.join(companyDir, 'sessions'),
+    source: settings.source || (brainRaw || companyRaw ? 'env' : 'default'),
+    brainExists: safeIsDirectory(brainDir),
+    companyExists: safeIsDirectory(companyDir),
+  };
+  connectAiPathCache = { at: now, value };
+  return value;
+}
+
+function readConnectAiSettings() {
+  const candidates = [
+    path.join(process.env.APPDATA || '', 'Antigravity', 'User', 'settings.json'),
+    path.join(process.env.APPDATA || '', 'Code', 'User', 'settings.json'),
+    path.join(process.env.APPDATA || '', 'Cursor', 'User', 'settings.json'),
+    path.join(process.env.APPDATA || '', 'Windsurf', 'User', 'settings.json'),
+    path.join(process.env.APPDATA || '', 'VSCodium', 'User', 'settings.json'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Microsoft VS Code', 'User', 'settings.json'),
+  ].filter(Boolean);
+
+  for (const file of candidates) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      const text = fs.readFileSync(file, 'utf8');
+      const localBrainPath = readJsonStringSetting(text, 'connectAiLab.localBrainPath');
+      const companyDir = readJsonStringSetting(text, 'connectAiLab.companyDir');
+      if (localBrainPath || companyDir) return { localBrainPath, companyDir, source: file };
+    } catch {}
+  }
+  return {};
+}
+
+function readJsonStringSetting(text, key) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = String(text || '').match(new RegExp(`"${escapedKey}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, 'm'));
+  if (!match) return '';
+  try {
+    return JSON.parse(`"${match[1]}"`);
+  } catch {
+    return match[1].replace(/\\\\/g, '\\');
+  }
+}
+
+function normalizeUserPath(value) {
+  let s = String(value || '').trim();
+  if (!s) return '';
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1);
+  if (s === '~') s = os.homedir();
+  else if (s.startsWith('~/') || s.startsWith('~\\')) s = path.join(os.homedir(), s.slice(2));
+  s = s.replace(/\$\{?(HOME|USERPROFILE|APPDATA|LOCALAPPDATA)\}?/g, (m, key) => {
+    if (key === 'HOME') return process.env.HOME || os.homedir();
+    return process.env[key] || m;
+  });
+  if (!path.isAbsolute(s)) return '';
+  return path.normalize(s);
+}
+
+function safeIsDirectory(dir) {
+  try {
+    return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function applyConnectAiPathGuard(body) {
+  if (!CONFIG.pathGuardEnabled || !body || !Array.isArray(body.messages) || !shouldInjectConnectAiPathGuard(body.messages)) {
+    return body;
+  }
+  return {
+    ...body,
+    __connectAiPathGuard: true,
+    messages: [
+      { role: 'system', content: buildConnectAiPathGuardMessage(resolveConnectAiPaths()) },
+      ...body.messages,
+    ],
+  };
+}
+
+function shouldInjectConnectAiPathGuard(messages) {
+  const text = messages
+    .map(message => typeof message?.content === 'string' ? message.content : '')
+    .join('\n')
+    .slice(0, 50000);
+  if (!text) return false;
+  if (messagesSuggestJson(messages) && !/^\s*\[CEO의 지시\]/m.test(text)) return false;
+  return /\[CEO의 지시\]|<\s*(?:list_files|read_file|create_file|edit_file|delete_file|glob|grep|run_command)\b|sessions\/|_company|회사\s*폴더|파일\s*경로|로컬\s*파일/i.test(text);
+}
+
+function buildConnectAiPathGuardMessage(paths) {
+  return [
+    '[ConnectAI Proxy Path Guard]',
+    'Use these resolved local paths. Do not infer, remember, or invent another knowledge-store path.',
+    `- Current brain root: ${paths.brainDir}`,
+    `- Current company root: ${paths.companyDir}`,
+    `- Current company sessions root: ${paths.sessionsDir}`,
+    '- Never use stale roots such as ~/Downloads/지식메모리 or C:\\Users\\user\\Downloads\\지식메모리.',
+    '- Never put session files under _agents/<agent>/sessions. The only valid session root is the company sessions root above.',
+    '- For current-round files, prefer a simple relative filename. For previous sessions, use the absolute company sessions root above.',
+    '- Before emitting action tags with path attributes, verify the path against this guard.',
+  ].join('\n');
+}
+
+function sanitizeConnectAiActionText(text) {
+  if (!CONFIG.pathGuardEnabled || typeof text !== 'string' || !text.includes('<')) return text;
+  return text
+    .replace(/(<(?:list_files|list_dir|ls|read_file|read|create_file|write_file|file|edit_file|edit|delete_file|delete|reveal_in_explorer|reveal|finder|explorer|open_file|open_in_app|launch)\b[^>]*?\b(?:path|dir|name|경로|파일)=)(["'])(.*?)\2/gi,
+      (full, prefix, quote, value) => prefix + quote + rewriteConnectAiActionPath(value) + quote)
+    .replace(/(<(?:list_files|list_dir|ls|read_file|read|create_file|write_file|file|edit_file|edit|delete_file|delete|reveal_in_explorer|reveal|finder|explorer|open_file|open_in_app|launch)\b[^>]*?\b(?:path|dir|name|경로|파일)=)([^\s'">]+)/gi,
+      (full, prefix, value) => prefix + rewriteConnectAiActionPath(value));
+}
+
+function rewriteConnectAiActionPath(value) {
+  const original = String(value || '').trim();
+  if (!original) return original;
+  const paths = resolveConnectAiPaths();
+  const slash = original.replace(/\\/g, '/');
+  const lower = slash.toLowerCase();
+  const company = paths.companyDir;
+  const sessions = paths.sessionsDir;
+
+  const staleRootPatterns = [
+    /^~\/Downloads\/지식메모리\/_company(?:\/|$)/i,
+    /^~\/Downloads\/지식메모리\/company(?:\/|$)/i,
+    /^C:\/Users\/user\/Downloads\/지식메모리\/_company(?:\/|$)/i,
+    /^C:\/Users\/user\/Downloads\/지식메모리\/company(?:\/|$)/i,
+  ];
+  for (const re of staleRootPatterns) {
+    if (re.test(slash)) {
+      const rest = slash.replace(re, '');
+      return rewriteCompanyRelativePath(rest, company, sessions);
+    }
+  }
+
+  const badAgentSessions = slash.match(/^(.*?)(?:_company\/)?_agents\/[^/]+\/sessions(?:\/(.*))?$/i);
+  if (badAgentSessions) {
+    const rest = badAgentSessions[2] || '';
+    return path.join(sessions, ...rest.split('/').filter(Boolean));
+  }
+
+  const noUnderscoreCompanySessions = slash.match(/^(.*?)[/\\]company\/sessions(?:\/(.*))?$/i);
+  if (noUnderscoreCompanySessions && !lower.includes('/_company/sessions')) {
+    const rest = noUnderscoreCompanySessions[2] || '';
+    return path.join(sessions, ...rest.split('/').filter(Boolean));
+  }
+
+  const displayCompanySessions = slash.match(/^Company\/sessions(?:\/(.*))?$/i);
+  if (displayCompanySessions) {
+    const rest = displayCompanySessions[1] || '';
+    return path.join(sessions, ...rest.split('/').filter(Boolean));
+  }
+
+  return original;
+}
+
+function rewriteCompanyRelativePath(rest, companyDir, sessionsDir) {
+  const clean = String(rest || '').replace(/^\/+/, '');
+  const badAgentSessions = clean.match(/^_agents\/[^/]+\/sessions(?:\/(.*))?$/i);
+  if (badAgentSessions) {
+    return path.join(sessionsDir, ...(badAgentSessions[1] || '').split('/').filter(Boolean));
+  }
+  return path.join(companyDir, ...clean.split('/').filter(Boolean));
+}
+
+function createActionTagStreamSanitizer(onChunk) {
+  let buffer = '';
+  const emit = chunk => {
+    if (chunk) onChunk(chunk);
+  };
+  const drain = final => {
+    while (buffer) {
+      const start = buffer.indexOf('<');
+      if (start < 0) {
+        emit(buffer);
+        buffer = '';
+        return;
+      }
+      if (start > 0) {
+        emit(buffer.slice(0, start));
+        buffer = buffer.slice(start);
+      }
+      const end = buffer.indexOf('>');
+      if (end < 0) {
+        if (final || buffer.length > 4096) {
+          const keep = final ? 0 : 1024;
+          const head = keep ? buffer.slice(0, -keep) : buffer;
+          buffer = keep ? buffer.slice(-keep) : '';
+          emit(sanitizeConnectAiActionText(head));
+        }
+        return;
+      }
+      const tag = buffer.slice(0, end + 1);
+      emit(sanitizeConnectAiActionText(tag));
+      buffer = buffer.slice(end + 1);
+    }
+  };
+  return {
+    push(chunk) {
+      buffer += String(chunk || '');
+      drain(false);
+    },
+    flush() {
+      drain(true);
+    },
+  };
+}
+
 function toOllamaNonStream(data, model) {
   return {
     model,
     created_at: new Date().toISOString(),
     message: {
       role: 'assistant',
-      content: cloudMessageContent(data),
+      content: sanitizeConnectAiActionText(cloudMessageContent(data)),
     },
     done: true,
   };
@@ -487,17 +743,24 @@ function readRaw(req) {
   });
 }
 
-function requestJson(method, targetUrl, body, headers = {}) {
+async function requestJson(method, targetUrl, body, headers = {}, options = {}) {
+  return retryUpstream(`json ${method} ${targetUrl}`, () => requestJsonOnce(method, targetUrl, body, headers, options), {
+    maxAttempts: options.retries,
+  });
+}
+
+function requestJsonOnce(method, targetUrl, body, headers = {}, options = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(targetUrl);
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const client = url.protocol === 'https:' ? https : http;
+    const timeoutMs = Number(options.timeoutMs || CONFIG.requestTimeoutMs);
     const req = client.request({
       method,
       hostname: url.hostname,
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
       path: url.pathname + url.search,
-      timeout: CONFIG.requestTimeoutMs,
+      timeout: timeoutMs,
       headers: {
         Accept: 'application/json',
         ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}),
@@ -509,7 +772,10 @@ function requestJson(method, targetUrl, body, headers = {}) {
       response.on('data', chunk => data += chunk);
       response.on('end', () => {
         if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error(`HTTP ${response.statusCode}: ${data}`));
+          const error = new Error(`HTTP ${response.statusCode}: ${data}`);
+          error.statusCode = response.statusCode;
+          error.responseBody = data;
+          reject(error);
           return;
         }
         try {
@@ -518,15 +784,22 @@ function requestJson(method, targetUrl, body, headers = {}) {
           reject(error);
         }
       });
+      response.on('error', reject);
     });
-    req.on('timeout', () => req.destroy(new Error(`timeout after ${CONFIG.requestTimeoutMs}ms`)));
+    req.on('timeout', () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
     req.on('error', reject);
     if (payload) req.write(payload);
     req.end();
   });
 }
 
-function requestAndPipe({ method, targetUrl, body, rawBody = false, headers = {}, res }) {
+async function requestAndPipe(args) {
+  return retryUpstream(`pipe ${args.method} ${args.targetUrl}`, () => requestAndPipeOnce(args), {
+    shouldRetry: error => !args.res.headersSent && isRetryableUpstreamError(error),
+  });
+}
+
+function requestAndPipeOnce({ method, targetUrl, body, rawBody = false, headers = {}, res }) {
   return new Promise((resolve, reject) => {
     const url = new URL(targetUrl);
     const payload = body === undefined ? undefined : (rawBody ? body : JSON.stringify(body));
@@ -548,6 +821,7 @@ function requestAndPipe({ method, targetUrl, body, rawBody = false, headers = {}
       });
       response.pipe(res);
       response.on('end', resolve);
+      response.on('error', reject);
     });
     req.on('timeout', () => req.destroy(new Error(`timeout after ${CONFIG.requestTimeoutMs}ms`)));
     req.on('error', reject);
@@ -560,6 +834,7 @@ function requestOpenAIStream(targetUrl, body, headers, onToken) {
   return new Promise((resolve, reject) => {
     const url = new URL(targetUrl);
     const payload = JSON.stringify(body);
+    let emittedTokens = 0;
     const client = url.protocol === 'https:' ? https : http;
     const req = client.request({
       method: 'POST',
@@ -576,7 +851,14 @@ function requestOpenAIStream(targetUrl, body, headers, onToken) {
         let errorBody = '';
         response.setEncoding('utf8');
         response.on('data', chunk => errorBody += chunk);
-        response.on('end', () => reject(new Error(`HTTP ${response.statusCode}: ${errorBody}`)));
+        response.on('end', () => {
+          const error = new Error(`HTTP ${response.statusCode}: ${errorBody}`);
+          error.statusCode = response.statusCode;
+          error.responseBody = errorBody;
+          error.emittedTokens = emittedTokens;
+          reject(error);
+        });
+        response.on('error', reject);
         return;
       }
 
@@ -594,20 +876,90 @@ function requestOpenAIStream(targetUrl, body, headers, onToken) {
           try {
             const json = JSON.parse(data);
             const token = json.choices?.[0]?.delta?.content || '';
-            if (token) onToken(token);
+            if (token) {
+              emittedTokens++;
+              onToken(token);
+            }
           } catch {}
         }
       });
       response.on('end', resolve);
+      response.on('error', error => {
+        error.emittedTokens = emittedTokens;
+        reject(error);
+      });
     });
     req.on('timeout', () => req.destroy(new Error(`timeout after ${CONFIG.requestTimeoutMs}ms`)));
-    req.on('error', reject);
+    req.on('error', error => {
+      error.emittedTokens = emittedTokens;
+      reject(error);
+    });
     req.write(payload);
     req.end();
   });
 }
 
+async function requestOpenAIStreamWithRetry(targetUrl, body, headers, onToken) {
+  for (let attempt = 1; attempt <= CONFIG.upstreamRetries; attempt++) {
+    try {
+      await requestOpenAIStream(targetUrl, body, headers, onToken);
+      return;
+    } catch (error) {
+      const emittedTokens = Number(error.emittedTokens || 0);
+      if (emittedTokens > 0 || attempt >= CONFIG.upstreamRetries || !isRetryableUpstreamError(error)) {
+        throw error;
+      }
+      await waitBeforeRetry('stream POST ' + targetUrl, attempt, error);
+    }
+  }
+}
+
+async function retryUpstream(label, fn, options = {}) {
+  const shouldRetry = options.shouldRetry || isRetryableUpstreamError;
+  const maxAttempts = Math.max(1, Number(options.maxAttempts || CONFIG.upstreamRetries));
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt >= maxAttempts || !shouldRetry(error)) throw error;
+      await waitBeforeRetry(label, attempt, error, maxAttempts);
+    }
+  }
+}
+
+async function waitBeforeRetry(label, attempt, error, maxAttempts = CONFIG.upstreamRetries) {
+  const delayMs = CONFIG.retryBaseDelayMs * attempt;
+  console.warn(`[connect-ai-proxy] upstream retry ${attempt}/${maxAttempts - 1} ${label}: ${error.code || error.message || error}`);
+  await new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+function isRetryableUpstreamError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const message = String(error?.message || error || '');
+  if (['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_SOCKET'].includes(code)) {
+    return true;
+  }
+  if (/ECONNRESET|socket hang up|aborted|timeout|ETIMEDOUT|EPIPE/i.test(message)) return true;
+  const status = Number(error?.statusCode || 0);
+  return [408, 429, 500, 502, 503, 504].includes(status);
+}
+
+function writeOllamaDone(res, model) {
+  if (res.writableEnded) return;
+  res.write(JSON.stringify({
+    model,
+    created_at: new Date().toISOString(),
+    message: { role: 'assistant', content: '' },
+    done: true,
+  }) + '\n');
+  res.end();
+}
+
 function sendJson(res, statusCode, body) {
+  if (res.headersSent) {
+    if (!res.writableEnded) res.end();
+    return;
+  }
   res.writeHead(statusCode, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
 }
